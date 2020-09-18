@@ -24,4 +24,5 @@ https://tianchi.aliyun.com/competition/entrance/531830/introduction
 
 选用lightgbm,catboost，xgboost 合成预测结果
 
+提交结果0.7356
 
