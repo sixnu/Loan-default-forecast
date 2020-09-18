@@ -1,0 +1,229 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import time
+import datetime 
+#模型
+import xgboost as xgb
+from catboost import CatBoostRegressor,CatBoostClassifier
+import lightgbm as lgb
+#模型评估
+from sklearn.metrics import roc_auc_score,mean_absolute_error
+from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score,train_test_split
+import sklearn.preprocessing as preprocessing
+
+
+#baseline
+#读取数据
+data_train=pd.read_csv('.../train.csv')
+data_test=pd.read_csv('.../testA.csv')
+data_train.policyCode.value_counts()
+data_test.policyCode.value_counts()
+#合并数据
+data_train['type']='train'
+data_test['type']='test'
+data_all=pd.concat([data_train,data_test],axis=0,ignore_index=True,sort=False)
+
+#查看数据类型
+data_all.info()
+
+#表头
+data_all.describe().T
+
+#查看缺失值 
+data_all.isnull().sum()/len(data_all)*100
+
+#查看基准值
+data_all.isDefault.describe()
+
+data_all.isDefault.value_counts()
+
+#查看各类型数据数量
+data_all.dtypes.value_counts()
+
+#数据清洗
+#issueDate 贷款发放的月份 转换为年数
+data_all.issueDate.value_counts()
+data_all['issueDate']=pd.to_datetime(data_all['issueDate'], errors='coerce')
+data_all['issueDate_1']=(data_all['issueDate'].max()-data_all['issueDate']).dt.days/365
+
+
+#earliesCreditLine 先转换日期格式的数据，再转换为年数
+#earliesCreditLine文本格式，需要转为日期
+data_all.earliesCreditLine.value_counts()
+data_all['earliesCreditLine']=pd.to_datetime(data_all['earliesCreditLine'], errors='coerce')
+
+data_all['earliesCreditLine']=(data_all['issueDate'].max()-data_all['earliesCreditLine']).dt.days/365
+
+#grade 贷款等级 数字化
+data_all.grade.value_counts()
+grade_mapping = {"A": 1, 
+                 "B": 2, 
+                 "C": 3, 
+                 "D": 4,
+                 "E": 5, 
+                 "F": 6, 
+                 "G": 7,}
+
+data_all.grade=data_all.grade.map(grade_mapping)
+#subGrade贷款子等级 数字化
+data_all.subGrade.value_counts()
+data_all.subGrade=data_all.subGrade.astype(str).map(lambda x:x[1]).astype(int)
+
+#employmentLength 工龄 数字化
+data_all.employmentLength.value_counts()
+data_all['employmentLength']=data_all['employmentLength'].astype(str).map(lambda x:x.split(" ")[0].split('+')[0])
+data_all['employmentLength']=data_all['employmentLength'].replace('<',0.5)
+data_all['employmentLength']=data_all['employmentLength'].replace('10',15)
+data_all['employmentLength']=data_all.employmentLength.astype('float')
+
+#,'n2.2','n2.3',训练集无数据，policyCode数据均为1，'issueDate'为时间格式，已转换为其他格式数据
+#建模
+X=data_all.loc[0:799999,:]
+X=X.drop(['isDefault','type','issueDate','id','policyCode','n2.2','n2.3'],axis=1)
+Y=data_all.loc[0:799999,'isDefault']
+x_test=data_all.loc[800000:,:].drop(['isDefault','type','issueDate','id','policyCode','n2.2','n2.3'],axis=1)
+
+
+print(X.shape)
+print(Y.shape)
+print(x_test.shape)
+
+#分割训练集和验证集
+from sklearn.model_selection import cross_val_score,train_test_split                                        
+x_train, x_valid, y_train, y_valid =train_test_split(X,Y,train_size=0.8,random_state=10)
+
+print(",训练数据特征:",x_train.shape,
+      ",验证数据特征:",x_valid.shape,
+     ",测试数据特征:",x_test.shape)
+print(",训练数据标签:",y_train.shape,
+     ',验证数据标签:',y_valid.shape)
+#模型(一)
+import lightgbm as lgb
+lgb_train = lgb.Dataset(x_train,label=y_train)
+lgb_valid = lgb.Dataset(x_valid,label=y_valid, reference=lgb_train)
+
+num_round = 10000
+params = {
+    'boosting_type': 'gbdt',
+    'objective':'binary',
+    'metric': 'auc',
+    'num_leaves': 60,
+    'learning_rate': 0.01,
+    'feature_fraction': 0.9,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'sigmoid':1,
+    'verbose': 0,
+    'subsample': 0.8, 
+    'n_estimators':10000    
+}
+
+results = {}
+
+lgbm = lgb.train(params,
+                lgb_train, 
+                num_boost_round= num_round, 
+                valid_sets=[lgb_valid,lgb_train],
+                valid_names=('validate','train'),
+                early_stopping_rounds =1000,
+                evals_result= results,
+                )
+lgbm_ypred=lgbm.predict(x_test.astype('float64'))
+# 测试集输出
+sub = pd.DataFrame()
+sub['id'] = data_test.id
+sub['isDefault']=lgbm_ypred
+sub.to_csv('lgbm_Default_predictions.csv', index=False)
+#查看预测结果
+sub['isDefault'].describe()
+#查看指标重要度 
+#未排序
+importance_lgbm=pd.DataFrame({ 'column': x_train.columns,
+                    'importance': lgbm.feature_importance(), })
+print(importance_lgbm)
+
+#模型二
+from catboost import CatBoostClassifier
+
+model_cb = CatBoostClassifier(n_estimators=10000,
+                            loss_function= 'Logloss',
+                            eval_metric='Accuracy',
+                            logging_level='Verbose',
+                            depth=5, 
+                            bootstrap_type= 'Bernoulli',
+                            learning_rate=0.01, 
+                            reg_lambda=4,
+                            one_hot_max_size= 3,
+                            subsample=0.6,
+                           )
+
+model_cb.fit(x_train, y_train, eval_set=[(x_valid,y_valid)], verbose=300, early_stopping_rounds=1500)
+
+cb_ypred=(model_cb.predict_proba(x_test, ntree_end=model_cb.best_iteration_))
+
+sub2= pd.DataFrame()
+sub2['id'] = data_test.id
+sub2['isDefault']=pd.DataFrame(cb_ypred)[1]
+sub2.to_csv('cb_Default_predictions.csv', index=False)
+sub2['isDefault'].describe()
+#查看指标重要性
+fea_ = model_cb.feature_importances_
+fea_name =model_cb.feature_names_
+plt.figure(figsize=(10, 10))
+plt.barh(fea_name,fea_,height =0.5)
+
+importance_cb=pd.DataFrame({
+        'column': model_cb.feature_names_,
+        'importance': model_cb.feature_importances_,
+    })
+importance_cb.set_index(['column'],inplace=True)
+print(importance_cb.sort_values(by='importance',ascending=False))
+#模型三
+import xgboost as xgb
+params = {
+        'objective':'binary:logistic',        
+        'n_estimators': 2000,
+        'booster':'gbtree',
+        'max_depth':8,
+        'eval_metric':'auc',
+        'learning_rate':0.01, 
+        'min_child_weight':5,
+        'subsample':0.8,
+        'colsample_bytree':0.75,
+        'seed':45,
+        'reg_alpha':1e-06,
+        'reg_lambda':2.8,
+        'gamma':0,
+        'nthread':-1,
+        'n_jobs':30
+}
+
+d_train = xgb.DMatrix(x_train, label=y_train)
+d_valid = xgb.DMatrix(x_valid, label=y_valid)
+d_test = xgb.DMatrix(x_test)
+
+watchlist = [(d_train, 'train'), (d_valid, 'valid')]
+
+xgb= xgb.train(params, d_train,4000, watchlist, early_stopping_rounds=500, maximize=False, verbose_eval=1)
+
+p_test = xgb.predict(d_test)
+print(pd.DataFrame(p_test).describe())
+sub3 = pd.DataFrame()
+sub3['id'] = data_test.id
+sub3['isDefault']=p_test
+sub3.to_csv('gxb_Default_predictions.csv', index=False)
+sub3['isDefault'].describe()
+#模型指标重要性
+xgb_important=pd.Series(xgb.get_fscore())
+xgb_important.sort_values()
+
+#预测合成
+sub4= pd.DataFrame()
+sub4['id'] = data_test.id
+sub4['isDefault']=sub['isDefault']*0.3+sub2['isDefault']*0.2+sub3['isDefault']*0.5
+sub4.to_csv('Default_predictions.csv', index=False)
